@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -11,6 +12,9 @@ import (
 
 	"github.com/nalanj/agent-queue/db"
 )
+
+// ErrJobNotFound is returned when a job does not exist
+var ErrJobNotFound = errors.New("job not found")
 
 type Client struct {
 	BaseURL string
@@ -129,6 +133,9 @@ func (c *Client) Extend(jobID int64) (*db.Job, error) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, ErrJobNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("extend failed: %s", string(body))

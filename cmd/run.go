@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -45,7 +46,9 @@ On failure, the job is left in processing state (will timeout and retry).`,
 
 		// Start extending in background
 		stopCh := make(chan struct{})
+		stoppedCh := make(chan struct{})
 		go func() {
+			defer close(stoppedCh)
 			ticker := time.NewTicker(runInterval)
 			defer ticker.Stop()
 			for {
@@ -53,7 +56,9 @@ On failure, the job is left in processing state (will timeout and retry).`,
 				case <-ticker.C:
 					_, err := c.Extend(job.ID)
 					if err != nil {
-						fmt.Fprintf(os.Stderr, "Warning: extend failed: %v\n", err)
+						// Job was deleted - stop extending silently
+						close(stopCh)
+						return
 					}
 				case <-stopCh:
 					return
@@ -66,6 +71,7 @@ On failure, the job is left in processing state (will timeout and retry).`,
 
 		// Stop the extend goroutine
 		close(stopCh)
+		<-stoppedCh
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Command failed: %v\n", err)
@@ -73,12 +79,11 @@ On failure, the job is left in processing state (will timeout and retry).`,
 			return nil
 		}
 
-		// Success - delete the job
-		if err := c.Delete(job.ID); err != nil {
+		// Success - try to delete the job (may already be deleted)
+		if err := c.Delete(job.ID); err != nil && !errors.Is(err, client.ErrJobNotFound) {
 			fmt.Fprintf(os.Stderr, "Warning: failed to delete job: %v\n", err)
-		} else {
-			fmt.Printf("Job %d completed and deleted.\n", job.ID)
 		}
+		fmt.Printf("Job %d completed.\n", job.ID)
 
 		return nil
 	},
@@ -99,7 +104,6 @@ func runCommand(body string, args []string) error {
 	cmd.Stderr = os.Stderr
 
 	// Write body in goroutine and close when done
-	errCh := make(chan error, 1)
 	go func() {
 		defer w.Close()
 		if body != "" {
@@ -107,8 +111,5 @@ func runCommand(body string, args []string) error {
 		}
 	}()
 
-	err := cmd.Run()
-	errCh <- err
-
-	return <-errCh
+	return cmd.Run()
 }
