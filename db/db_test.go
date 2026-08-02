@@ -3,6 +3,7 @@ package db
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func TestNew(t *testing.T) {
@@ -166,5 +167,95 @@ func TestListJobs(t *testing.T) {
 	}
 	if len(jobs) != 2 {
 		t.Errorf("ListJobs(paginate) len = %d, want %d", len(jobs), 2)
+	}
+}
+
+func TestClaimTimeout(t *testing.T) {
+	tmp := t.TempDir() + "/test.db"
+	defer os.Remove(tmp)
+
+	db, err := New(tmp)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	// Set a short timeout for testing
+	db.SetClaimTimeout(100 * time.Millisecond)
+
+	// Create and claim a job
+	db.CreateJob("dedupe-1", "job 1", nil)
+	job, _ := db.ClaimJob()
+	if job.Status != "processing" {
+		t.Errorf("ClaimJob() status = %q, want %q", job.Status, "processing")
+	}
+
+	// Extend should work immediately
+	_, err = db.ExtendJob(job.ID)
+	if err != nil {
+		t.Errorf("ExtendJob() immediately = %v, want nil", err)
+	}
+
+	// Wait for timeout to pass
+	time.Sleep(150 * time.Millisecond)
+
+	// Extend should fail after timeout
+	_, err = db.ExtendJob(job.ID)
+	if err == nil {
+		t.Error("ExtendJob() after timeout = nil, want error")
+	}
+
+	// ClaimJob should release the timed-out job
+	newJob, _ := db.ClaimJob()
+	if newJob == nil {
+		t.Fatal("ClaimJob() should return released job")
+	}
+	if newJob.ID != job.ID {
+		t.Errorf("ClaimJob() released job ID = %d, want %d", newJob.ID, job.ID)
+	}
+	if newJob.Status != "processing" {
+		t.Errorf("ClaimJob() released job status = %q, want %q", newJob.Status, "processing")
+	}
+}
+
+func TestReleaseTimedOutJobs(t *testing.T) {
+	tmp := t.TempDir() + "/test.db"
+	defer os.Remove(tmp)
+
+	db, err := New(tmp)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	db.SetClaimTimeout(50 * time.Millisecond)
+
+	// Create multiple jobs and claim them
+	db.CreateJob("dedupe-1", "job 1", nil)
+	db.CreateJob("dedupe-2", "job 2", nil)
+	db.ClaimJob()
+	db.ClaimJob()
+
+	// Should release 0 before timeout
+	n, _ := db.ReleaseTimedOutJobs()
+	if n != 0 {
+		t.Errorf("ReleaseTimedOutJobs() before timeout = %d, want 0", n)
+	}
+
+	// Wait for timeout
+	time.Sleep(100 * time.Millisecond)
+
+	// Should release all timed-out jobs
+	n, _ = db.ReleaseTimedOutJobs()
+	if n != 2 {
+		t.Errorf("ReleaseTimedOutJobs() after timeout = %d, want 2", n)
 	}
 }

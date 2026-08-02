@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"strings"
 	"time"
@@ -21,7 +22,22 @@ type Job struct {
 }
 
 type DB struct {
-	conn *sql.DB
+	conn         *sql.DB
+	claimTimeout time.Duration
+}
+
+// DefaultClaimTimeout is the default time before a claim expires
+const DefaultClaimTimeout = 5 * time.Minute
+
+func (db *DB) SetClaimTimeout(d time.Duration) {
+	db.claimTimeout = d
+}
+
+func (db *DB) GetClaimTimeout() time.Duration {
+	if db.claimTimeout == 0 {
+		return DefaultClaimTimeout
+	}
+	return db.claimTimeout
 }
 
 func New(path string) (*DB, error) {
@@ -38,7 +54,19 @@ func NewFromEnv() (*DB, error) {
 	if path == "" {
 		path = "agent-queue.db"
 	}
-	return New(path)
+	db, err := New(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Set claim timeout from env var (in seconds)
+	if timeoutStr := os.Getenv("AGENT_QUEUE_CLAIM_TIMEOUT"); timeoutStr != "" {
+		if timeout, err := time.ParseDuration(timeoutStr); err == nil {
+			db.SetClaimTimeout(timeout)
+		}
+	}
+
+	return db, nil
 }
 
 func (db *DB) Close() error {
@@ -155,7 +183,28 @@ func (db *DB) GetJobByDedupeKey(dedupeKey string) (*Job, error) {
 	return &job, nil
 }
 
+// ReleaseTimedOutJobs releases jobs that have been claimed but exceeded the timeout
+func (db *DB) ReleaseTimedOutJobs() (int, error) {
+	claimTimeout := db.GetClaimTimeout()
+	cutoff := time.Now().Add(-claimTimeout)
+
+	result, err := db.conn.Exec(
+		`UPDATE items SET status = 'pending', claimed_at = NULL 
+		 WHERE status = 'processing' AND claimed_at < ?`,
+		cutoff,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	n, _ := result.RowsAffected()
+	return int(n), nil
+}
+
 func (db *DB) ClaimJob() (*Job, error) {
+	// Release any timed-out jobs first
+	db.ReleaseTimedOutJobs()
+
 	now := time.Now()
 
 	// Find oldest pending job and claim it
@@ -182,10 +231,29 @@ func (db *DB) ClaimJob() (*Job, error) {
 	return db.GetJob(id)
 }
 
+// IsTimedOut checks if a job's claim has timed out
+func (db *DB) IsTimedOut(job *Job) bool {
+	if job.Status != "processing" || job.ClaimedAt == nil {
+		return false
+	}
+	return time.Since(*job.ClaimedAt) > db.GetClaimTimeout()
+}
+
 func (db *DB) ExtendJob(id int64) (*Job, error) {
+	// Get the job first
+	job, err := db.GetJob(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if timed out
+	if db.IsTimedOut(job) {
+		return nil, fmt.Errorf("job claim has timed out")
+	}
+
 	now := time.Now()
 
-	_, err := db.conn.Exec(
+	_, err = db.conn.Exec(
 		`UPDATE items SET claimed_at = ? WHERE id = ? AND status = 'processing'`,
 		now, id,
 	)
