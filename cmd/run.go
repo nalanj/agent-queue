@@ -23,8 +23,7 @@ var runCmd = &cobra.Command{
 piped to stdin. The job claim is extended periodically while the command
 runs to prevent timeout.
 
-On success, the job is deleted.
-On failure, the job is left in processing state (will timeout and retry).`,
+The caller is responsible for deleting the job when done.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if len(args) == 0 {
 			return fmt.Errorf("command required")
@@ -75,15 +74,11 @@ On failure, the job is left in processing state (will timeout and retry).`,
 
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Command failed: %v\n", err)
-			// Leave job in processing state - it will timeout and retry
+			// Leave job in processing state - caller should delete when done
 			return nil
 		}
 
-		// Success - try to delete the job (may already be deleted)
-		if err := c.Delete(job.ID); err != nil && !errors.Is(err, client.ErrJobNotFound) {
-			fmt.Fprintf(os.Stderr, "Warning: failed to delete job: %v\n", err)
-		}
-		fmt.Printf("Job %d completed.\n", job.ID)
+		fmt.Printf("Job %d command completed.\n", job.ID)
 
 		return nil
 	},
@@ -113,3 +108,6 @@ func runCommand(body string, args []string) error {
 
 	return cmd.Run()
 }
+
+// suppress unused warning
+var _ = errors.Is
