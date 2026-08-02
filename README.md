@@ -47,6 +47,14 @@ export AGENT_QUEUE_API_KEY=your-secret-key
 
 The CLI uses the same `X-API-Key` header and `AGENT_QUEUE_API_KEY` environment variable as the server.
 
+## Environment Variables
+
+| Variable            | Default           | Description                              |
+|---------------------|-------------------|------------------------------------------|
+| `AGENT_QUEUE_API_KEY` | (required)       | API key for authentication              |
+| `AGENT_QUEUE_DB_PATH` | `agent-queue.db` | Path to the SQLite database file         |
+| `AGENT_QUEUE_URL`    | `http://localhost:8080` | Server URL (CLI only)          |
+
 ## Authentication
 
 All requests require an API key via the `X-API-Key` header:
