@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -11,23 +12,28 @@ import (
 )
 
 type Job struct {
-	ID         int64      `json:"id"`
-	DedupeKey  string     `json:"dedupe_key"`
-	Body       string     `json:"body"`
-	Tags       []string   `json:"tags"`
-	Status     string     `json:"status"`
-	CreatedAt  time.Time  `json:"created_at"`
-	ClaimedAt  *time.Time `json:"claimed_at,omitempty"`
-	ProcessedAt *time.Time `json:"processed_at,omitempty"`
+	ID          int64       `json:"id"`
+	DedupeKey   string      `json:"dedupe_key"`
+	Body        string      `json:"body"`
+	Tags        []string    `json:"tags"`
+	Status      string      `json:"status"`
+	RetryCount  int         `json:"retry_count"`
+	CreatedAt   time.Time   `json:"created_at"`
+	ClaimedAt   *time.Time  `json:"claimed_at,omitempty"`
+	ProcessedAt *time.Time  `json:"processed_at,omitempty"`
 }
 
 type DB struct {
 	conn         *sql.DB
 	claimTimeout time.Duration
+	maxRetries   int
 }
 
 // DefaultClaimTimeout is the default time before a claim expires
 const DefaultClaimTimeout = 5 * time.Minute
+
+// DefaultMaxRetries is the default number of times a job can time out before failing
+const DefaultMaxRetries = 3
 
 func (db *DB) SetClaimTimeout(d time.Duration) {
 	db.claimTimeout = d
@@ -38,6 +44,17 @@ func (db *DB) GetClaimTimeout() time.Duration {
 		return DefaultClaimTimeout
 	}
 	return db.claimTimeout
+}
+
+func (db *DB) SetMaxRetries(n int) {
+	db.maxRetries = n
+}
+
+func (db *DB) GetMaxRetries() int {
+	if db.maxRetries == 0 {
+		return DefaultMaxRetries
+	}
+	return db.maxRetries
 }
 
 func New(path string) (*DB, error) {
@@ -59,10 +76,17 @@ func NewFromEnv() (*DB, error) {
 		return nil, err
 	}
 
-	// Set claim timeout from env var (in seconds)
+	// Set claim timeout from env var
 	if timeoutStr := os.Getenv("AGENT_QUEUE_CLAIM_TIMEOUT"); timeoutStr != "" {
 		if timeout, err := time.ParseDuration(timeoutStr); err == nil {
 			db.SetClaimTimeout(timeout)
+		}
+	}
+
+	// Set max retries from env var
+	if maxRetriesStr := os.Getenv("AGENT_QUEUE_MAX_RETRIES"); maxRetriesStr != "" {
+		if maxRetries, err := strconv.Atoi(maxRetriesStr); err == nil {
+			db.SetMaxRetries(maxRetries)
 		}
 	}
 
@@ -81,6 +105,7 @@ func (db *DB) Migrate() error {
 			body TEXT NOT NULL,
 			tags TEXT NOT NULL DEFAULT '[]',
 			status TEXT NOT NULL DEFAULT 'pending',
+			retry_count INTEGER NOT NULL DEFAULT 0,
 			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 			claimed_at DATETIME,
 			processed_at DATETIME
@@ -96,7 +121,20 @@ func (db *DB) Migrate() error {
 	}
 
 	_, err = db.conn.Exec(`CREATE INDEX IF NOT EXISTS idx_items_status ON items(status)`)
-	return err
+	if err != nil {
+		return err
+	}
+
+	// Add retry_count column if it doesn't exist (for existing databases)
+	_, err = db.conn.Exec(`ALTER TABLE items ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0`)
+	if err != nil && err != sql.ErrNoRows {
+		// Ignore "duplicate column name" error
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (db *DB) CreateJob(dedupeKey, body string, tags []string) (*Job, error) {
@@ -133,7 +171,7 @@ func (db *DB) CreateJob(dedupeKey, body string, tags []string) (*Job, error) {
 
 func (db *DB) GetJob(id int64) (*Job, error) {
 	row := db.conn.QueryRow(
-		`SELECT id, dedupe_key, body, tags, status, created_at, claimed_at, processed_at FROM items WHERE id = ?`,
+		`SELECT id, dedupe_key, body, tags, status, retry_count, created_at, claimed_at, processed_at FROM items WHERE id = ?`,
 		id,
 	)
 
@@ -141,7 +179,7 @@ func (db *DB) GetJob(id int64) (*Job, error) {
 	var tagsStr string
 	var claimedAt, processedAt sql.NullTime
 
-	err := row.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.CreatedAt, &claimedAt, &processedAt)
+	err := row.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.RetryCount, &job.CreatedAt, &claimedAt, &processedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +197,7 @@ func (db *DB) GetJob(id int64) (*Job, error) {
 
 func (db *DB) GetJobByDedupeKey(dedupeKey string) (*Job, error) {
 	row := db.conn.QueryRow(
-		`SELECT id, dedupe_key, body, tags, status, created_at, claimed_at, processed_at FROM items WHERE dedupe_key = ?`,
+		`SELECT id, dedupe_key, body, tags, status, retry_count, created_at, claimed_at, processed_at FROM items WHERE dedupe_key = ?`,
 		dedupeKey,
 	)
 
@@ -167,7 +205,7 @@ func (db *DB) GetJobByDedupeKey(dedupeKey string) (*Job, error) {
 	var tagsStr string
 	var claimedAt, processedAt sql.NullTime
 
-	err := row.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.CreatedAt, &claimedAt, &processedAt)
+	err := row.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.RetryCount, &job.CreatedAt, &claimedAt, &processedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -184,14 +222,27 @@ func (db *DB) GetJobByDedupeKey(dedupeKey string) (*Job, error) {
 }
 
 // ReleaseTimedOutJobs releases jobs that have been claimed but exceeded the timeout
+// If a job has exceeded max retries, it is marked as 'failed' instead
 func (db *DB) ReleaseTimedOutJobs() (int, error) {
 	claimTimeout := db.GetClaimTimeout()
+	maxRetries := db.GetMaxRetries()
 	cutoff := time.Now().Add(-claimTimeout)
 
+	// First, handle jobs that have exceeded max retries (mark as failed)
+	_, err := db.conn.Exec(
+		`UPDATE items SET status = 'failed', claimed_at = NULL
+		 WHERE status = 'processing' AND claimed_at < ? AND retry_count >= ?`,
+		cutoff, maxRetries,
+	)
+	if err != nil {
+		return 0, err
+	}
+
+	// Then, release jobs that haven't exceeded retries (increment retry count)
 	result, err := db.conn.Exec(
-		`UPDATE items SET status = 'pending', claimed_at = NULL 
-		 WHERE status = 'processing' AND claimed_at < ?`,
-		cutoff,
+		`UPDATE items SET status = 'pending', claimed_at = NULL, retry_count = retry_count + 1
+		 WHERE status = 'processing' AND claimed_at < ? AND retry_count < ?`,
+		cutoff, maxRetries,
 	)
 	if err != nil {
 		return 0, err
@@ -286,7 +337,7 @@ func (db *DB) ListJobs(page, limit int, status string, tags []string) ([]Job, in
 	offset := (page - 1) * limit
 
 	// Build query
-	query := `SELECT id, dedupe_key, body, tags, status, created_at, claimed_at, processed_at FROM items WHERE 1=1`
+	query := `SELECT id, dedupe_key, body, tags, status, retry_count, created_at, claimed_at, processed_at FROM items WHERE 1=1`
 	countQuery := `SELECT COUNT(*) FROM items WHERE 1=1`
 	args := []interface{}{}
 
@@ -328,7 +379,7 @@ func (db *DB) ListJobs(page, limit int, status string, tags []string) ([]Job, in
 		var tagsStr string
 		var claimedAt, processedAt sql.NullTime
 
-		err := rows.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.CreatedAt, &claimedAt, &processedAt)
+		err := rows.Scan(&job.ID, &job.DedupeKey, &job.Body, &tagsStr, &job.Status, &job.RetryCount, &job.CreatedAt, &claimedAt, &processedAt)
 		if err != nil {
 			return nil, 0, err
 		}

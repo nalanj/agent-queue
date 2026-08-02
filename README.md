@@ -55,6 +55,7 @@ The CLI uses the same `X-API-Key` header and `AGENT_QUEUE_API_KEY` environment v
 | `AGENT_QUEUE_DB_PATH`  | `agent-queue.db` | Path to the SQLite database file         |
 | `AGENT_QUEUE_URL`      | `http://localhost:8080` | Server URL (CLI only)           |
 | `AGENT_QUEUE_CLAIM_TIMEOUT` | `5m`         | Time before a claim expires (e.g., `30s`, `5m`, `1h`) |
+| `AGENT_QUEUE_MAX_RETRIES`  | `3`            | Times a job can timeout before being marked 'failed' |
 
 ## Authentication
 
@@ -106,6 +107,8 @@ Response:
 ```
 
 If a job with the same `dedupe_key` already exists, returns the existing job without creating a duplicate.
+
+If a job times out more than `AGENT_QUEUE_MAX_RETRIES` times, it is automatically marked as `failed`.
 
 ### Dequeue
 
@@ -209,6 +212,7 @@ Jobs are stored in the `items` table:
 | `status`      | TEXT     | Current state: `pending`, `processing`, `completed`, `failed` |
 | `created_at`   | DATETIME | When the job was enqueued               |
 | `claimed_at`   | DATETIME | When a worker claimed the job           |
+| `retry_count`  | INTEGER  | Number of times the job timed out       |
 | `processed_at` | DATETIME | When the job finished                   |
 
 ## Roadmap

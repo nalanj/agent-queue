@@ -259,3 +259,73 @@ func TestReleaseTimedOutJobs(t *testing.T) {
 		t.Errorf("ReleaseTimedOutJobs() after timeout = %d, want 2", n)
 	}
 }
+
+func TestMaxRetriesAutoFail(t *testing.T) {
+	tmp := t.TempDir() + "/test.db"
+	defer os.Remove(tmp)
+
+	db, err := New(tmp)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Migrate(); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	db.SetClaimTimeout(50 * time.Millisecond)
+	db.SetMaxRetries(2) // Fail after 2 retries
+
+	// Create and claim a job
+	db.CreateJob("dedupe-1", "job 1", nil)
+	job, _ := db.ClaimJob()
+
+	// First timeout - should be released with retry_count = 1
+	time.Sleep(100 * time.Millisecond)
+	db.ReleaseTimedOutJobs()
+
+	job, _ = db.GetJob(job.ID)
+	if job.Status != "pending" {
+		t.Errorf("First timeout status = %q, want %q", job.Status, "pending")
+	}
+	if job.RetryCount != 1 {
+		t.Errorf("First timeout retry_count = %d, want %d", job.RetryCount, 1)
+	}
+
+	// Claim again
+	job, _ = db.ClaimJob()
+
+	// Second timeout - should be released with retry_count = 2
+	time.Sleep(100 * time.Millisecond)
+	db.ReleaseTimedOutJobs()
+
+	job, _ = db.GetJob(job.ID)
+	if job.Status != "pending" {
+		t.Errorf("Second timeout status = %q, want %q", job.Status, "pending")
+	}
+	if job.RetryCount != 2 {
+		t.Errorf("Second timeout retry_count = %d, want %d", job.RetryCount, 2)
+	}
+
+	// Claim again
+	job, _ = db.ClaimJob()
+
+	// Third timeout - should be marked as failed (exceeded max retries)
+	time.Sleep(100 * time.Millisecond)
+	db.ReleaseTimedOutJobs()
+
+	job, _ = db.GetJob(job.ID)
+	if job.Status != "failed" {
+		t.Errorf("Third timeout status = %q, want %q", job.Status, "failed")
+	}
+	if job.RetryCount != 2 {
+		t.Errorf("Third timeout retry_count = %d, want %d", job.RetryCount, 2)
+	}
+
+	// Should not be able to claim failed jobs
+	newJob, _ := db.ClaimJob()
+	if newJob != nil && newJob.ID == job.ID {
+		t.Error("Should not claim failed jobs")
+	}
+}
