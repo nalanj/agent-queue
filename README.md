@@ -36,6 +36,10 @@ agent-queue delete <job-id>
 
 # List jobs
 agent-queue list --status pending --page 1
+
+# Run a command with job body as stdin
+agent-queue run -- cat
+agent-queue run -- ./process.sh
 ```
 
 By default, the CLI connects to `http://localhost:8080`. Set the `AGENT_QUEUE_URL` environment variable to change this:
